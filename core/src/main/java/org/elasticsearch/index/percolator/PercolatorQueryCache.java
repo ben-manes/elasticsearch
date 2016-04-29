@@ -19,7 +19,15 @@
 
 package org.elasticsearch.index.percolator;
 
-import com.carrotsearch.hppc.IntObjectHashMap;
+import static org.elasticsearch.index.percolator.PercolatorFieldMapper.LEGACY_TYPE_NAME;
+import static org.elasticsearch.index.percolator.PercolatorFieldMapper.parseQuery;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
+import java.util.function.Supplier;
+
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.LeafReader;
@@ -37,8 +45,6 @@ import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.Version;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
-import org.elasticsearch.common.cache.Cache;
-import org.elasticsearch.common.cache.CacheBuilder;
 import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.xcontent.XContent;
@@ -55,6 +61,7 @@ import org.elasticsearch.index.mapper.FieldMapper;
 import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.mapper.internal.SourceFieldMapper;
 import org.elasticsearch.index.mapper.internal.TypeFieldMapper;
+import org.elasticsearch.index.percolator.PercolatorFieldMapper.PercolatorFieldType;
 import org.elasticsearch.index.query.PercolateQuery;
 import org.elasticsearch.index.query.QueryShardContext;
 import org.elasticsearch.index.shard.IndexShard;
@@ -62,15 +69,9 @@ import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.shard.ShardUtils;
 import org.elasticsearch.threadpool.ThreadPool;
 
-import java.io.Closeable;
-import java.io.IOException;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executor;
-import java.util.function.Supplier;
-
-import static org.elasticsearch.index.percolator.PercolatorFieldMapper.LEGACY_TYPE_NAME;
-import static org.elasticsearch.index.percolator.PercolatorFieldMapper.PercolatorFieldType;
-import static org.elasticsearch.index.percolator.PercolatorFieldMapper.parseQuery;
+import com.carrotsearch.hppc.IntObjectHashMap;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 
 public final class PercolatorQueryCache extends AbstractIndexComponent
         implements Closeable, LeafReader.CoreClosedListener, PercolateQuery.QueryRegistry {
@@ -87,13 +88,13 @@ public final class PercolatorQueryCache extends AbstractIndexComponent
     public PercolatorQueryCache(IndexSettings indexSettings, Supplier<QueryShardContext> queryShardContextSupplier) {
         super(indexSettings);
         this.queryShardContextSupplier = queryShardContextSupplier;
-        cache = CacheBuilder.<Object, QueriesLeaf>builder().build();
+        cache = Caffeine.newBuilder().build();
         this.mapUnmappedFieldsAsString = indexSettings.getValue(INDEX_MAP_UNMAPPED_FIELDS_AS_STRING_SETTING);
     }
 
     @Override
     public Leaf getQueries(LeafReaderContext ctx) {
-        QueriesLeaf percolatorQueries = cache.get(ctx.reader().getCoreCacheKey());
+        QueriesLeaf percolatorQueries = cache.getIfPresent(ctx.reader().getCoreCacheKey());
         if (percolatorQueries == null) {
             throw new IllegalStateException("queries not loaded, queries should be have been preloaded during index warming...");
         }
@@ -109,7 +110,7 @@ public final class PercolatorQueryCache extends AbstractIndexComponent
             public TerminationHandle warmReader(IndexShard indexShard, Searcher searcher) {
                 final CountDownLatch latch = new CountDownLatch(searcher.reader().leaves().size());
                 for (final LeafReaderContext ctx : searcher.reader().leaves()) {
-                    if (cache.get(ctx.reader().getCoreCacheKey()) != null) {
+                    if (cache.getIfPresent(ctx.reader().getCoreCacheKey()) != null) {
                         latch.countDown();
                         continue;
                     }
@@ -235,7 +236,7 @@ public final class PercolatorQueryCache extends AbstractIndexComponent
 
     public PercolatorQueryCacheStats getStats(ShardId shardId) {
         int numberOfQueries = 0;
-        for (QueriesLeaf queries : cache.values()) {
+        for (QueriesLeaf queries : cache.asMap().values()) {
             if (shardId.equals(queries.shardId)) {
                 numberOfQueries += queries.queries.size();
             }

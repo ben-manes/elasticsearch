@@ -19,7 +19,30 @@
 
 package org.elasticsearch.indices;
 
-import com.carrotsearch.hppc.cursors.ObjectCursor;
+import static java.util.Collections.emptyMap;
+import static java.util.Collections.unmodifiableMap;
+import static org.elasticsearch.common.collect.MapBuilder.newMapBuilder;
+import static org.elasticsearch.common.util.CollectionUtils.arrayAsArrayList;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.store.LockObtainFailedException;
 import org.apache.lucene.util.CollectionUtil;
@@ -39,7 +62,6 @@ import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.bytes.BytesReference;
-import org.elasticsearch.common.cache.RemovalNotification;
 import org.elasticsearch.common.component.AbstractLifecycleComponent;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.io.FileSystemUtils;
@@ -96,29 +118,8 @@ import org.elasticsearch.search.query.QueryPhase;
 import org.elasticsearch.search.query.QuerySearchResult;
 import org.elasticsearch.threadpool.ThreadPool;
 
-import java.io.Closeable;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.EnumSet;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Predicate;
-import java.util.stream.Collectors;
-
-import static java.util.Collections.emptyMap;
-import static java.util.Collections.unmodifiableMap;
-import static org.elasticsearch.common.collect.MapBuilder.newMapBuilder;
-import static org.elasticsearch.common.util.CollectionUtils.arrayAsArrayList;
+import com.carrotsearch.hppc.cursors.ObjectCursor;
+import com.github.benmanes.caffeine.cache.RemovalCause;
 
 /**
  *
@@ -948,7 +949,7 @@ public class IndicesService extends AbstractLifecycleComponent<IndicesService> i
                 logger.trace("running periodic field data cache cleanup");
             }
             try {
-                this.cache.getCache().refresh();
+                this.cache.getCache().cleanUp();
             } catch (Exception e) {
                 logger.warn("Exception during periodic field data cache cleanup:", e);
             }
@@ -1111,8 +1112,8 @@ public class IndicesService extends AbstractLifecycleComponent<IndicesService> i
         }
 
         @Override
-        public void onRemoval(RemovalNotification<IndicesRequestCache.Key, IndicesRequestCache.Value> notification) {
-            requestCache.onRemoval(notification.getKey(), notification.getValue(), notification.getRemovalReason() == RemovalNotification.RemovalReason.EVICTED);
+        public void onRemoval(IndicesRequestCache.Key key, IndicesRequestCache.Value value, RemovalCause cause) {
+            requestCache.onRemoval(key, value, cause.wasEvicted());
         }
 
     }

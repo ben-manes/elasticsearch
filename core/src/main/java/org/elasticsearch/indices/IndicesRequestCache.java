@@ -19,18 +19,21 @@
 
 package org.elasticsearch.indices;
 
-import com.carrotsearch.hppc.ObjectHashSet;
-import com.carrotsearch.hppc.ObjectSet;
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.Set;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.util.Accountable;
 import org.apache.lucene.util.RamUsageEstimator;
 import org.elasticsearch.common.bytes.BytesReference;
-import org.elasticsearch.common.cache.Cache;
-import org.elasticsearch.common.cache.CacheBuilder;
-import org.elasticsearch.common.cache.CacheLoader;
-import org.elasticsearch.common.cache.RemovalListener;
-import org.elasticsearch.common.cache.RemovalNotification;
 import org.elasticsearch.common.component.AbstractComponent;
 import org.elasticsearch.common.lucene.index.ElasticsearchDirectoryReader;
 import org.elasticsearch.common.settings.Setting;
@@ -40,14 +43,12 @@ import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
 
-import java.io.Closeable;
-import java.io.IOException;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.Set;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.TimeUnit;
+import com.carrotsearch.hppc.ObjectHashSet;
+import com.carrotsearch.hppc.ObjectSet;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalCause;
+import com.github.benmanes.caffeine.cache.RemovalListener;
 
 /**
  * The indices request cache allows to cache a shard level request stage responses, helping with improving
@@ -87,10 +88,15 @@ public final class IndicesRequestCache extends AbstractComponent implements Remo
         this.size = INDICES_CACHE_QUERY_SIZE.get(settings);
         this.expire = INDICES_CACHE_QUERY_EXPIRE.exists(settings) ? INDICES_CACHE_QUERY_EXPIRE.get(settings) : null;
         long sizeInBytes = size.bytes();
-        CacheBuilder<Key, Value> cacheBuilder = CacheBuilder.<Key, Value>builder()
-            .setMaximumWeight(sizeInBytes).weigher((k, v) -> k.ramBytesUsed() + v.ramBytesUsed()).removalListener(this);
+        Caffeine<Key, Value> cacheBuilder = Caffeine.newBuilder()
+            .removalListener(this)
+            .maximumWeight(sizeInBytes)
+            .weigher((Key k, Value v) -> {
+                long weight = k.ramBytesUsed() + v.ramBytesUsed();
+                return (int) Math.min(weight, Integer.MAX_VALUE);
+            });
         if (expire != null) {
-            cacheBuilder.setExpireAfterAccess(TimeUnit.MILLISECONDS.toNanos(expire.millis()));
+            cacheBuilder.expireAfterAccess(expire.millis(), TimeUnit.MILLISECONDS);
         }
         cache = cacheBuilder.build();
     }
@@ -106,14 +112,14 @@ public final class IndicesRequestCache extends AbstractComponent implements Remo
     }
 
     @Override
-    public void onRemoval(RemovalNotification<Key, Value> notification) {
-        notification.getKey().entity.onRemoval(notification);
+    public void onRemoval(Key key, Value value, RemovalCause cause) {
+      key.entity.onRemoval(key, value, cause);
     }
 
     BytesReference getOrCompute(CacheEntity cacheEntity, DirectoryReader reader, BytesReference cacheKey) throws Exception {
         final Key key =  new Key(cacheEntity, reader.getVersion(), cacheKey);
         Loader loader = new Loader(cacheEntity);
-        Value value = cache.computeIfAbsent(key, loader);
+        Value value = cache.get(key, loader);
         if (loader.isLoaded()) {
             key.entity.onMiss();
             // see if its the first time we see this reader, and make sure to register a cleanup key
@@ -130,7 +136,7 @@ public final class IndicesRequestCache extends AbstractComponent implements Remo
         return value.reference;
     }
 
-    private static class Loader implements CacheLoader<Key, Value> {
+    private static class Loader implements Function<Key, Value> {
 
         private final CacheEntity entity;
         private boolean loaded;
@@ -144,11 +150,15 @@ public final class IndicesRequestCache extends AbstractComponent implements Remo
         }
 
         @Override
-        public Value load(Key key) throws Exception {
-            Value value = entity.loadValue();
-            entity.onCached(key, value);
-            loaded = true;
-            return value;
+        public Value apply(Key key) {
+            try {
+                Value value = entity.loadValue();
+                entity.onCached(key, value);
+                loaded = true;
+                return value;
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
         }
     }
 
@@ -191,7 +201,7 @@ public final class IndicesRequestCache extends AbstractComponent implements Remo
         /**
          * Called when this entity instance is removed
          */
-        void onRemoval(RemovalNotification<Key, Value> notification);
+        void onRemoval(Key key, Value value, RemovalCause cause);
     }
 
 
@@ -240,11 +250,19 @@ public final class IndicesRequestCache extends AbstractComponent implements Remo
 
         @Override
         public boolean equals(Object o) {
-            if (this == o) return true;
+            if (this == o) {
+              return true;
+            }
             Key key = (Key) o;
-            if (readerVersion != key.readerVersion) return false;
-            if (!entity.getCacheIdentity().equals(key.entity.getCacheIdentity())) return false;
-            if (!value.equals(key.value)) return false;
+            if (readerVersion != key.readerVersion) {
+              return false;
+            }
+            if (!entity.getCacheIdentity().equals(key.entity.getCacheIdentity())) {
+              return false;
+            }
+            if (!value.equals(key.value)) {
+              return false;
+            }
             return true;
         }
 
@@ -276,10 +294,16 @@ public final class IndicesRequestCache extends AbstractComponent implements Remo
 
         @Override
         public boolean equals(Object o) {
-            if (this == o) return true;
+            if (this == o) {
+              return true;
+            }
             CleanupKey that = (CleanupKey) o;
-            if (readerVersion != that.readerVersion) return false;
-            if (!entity.getCacheIdentity().equals(that.entity.getCacheIdentity())) return false;
+            if (readerVersion != that.readerVersion) {
+              return false;
+            }
+            if (!entity.getCacheIdentity().equals(that.entity.getCacheIdentity())) {
+              return false;
+            }
             return true;
         }
 
@@ -309,7 +333,7 @@ public final class IndicesRequestCache extends AbstractComponent implements Remo
             }
         }
         if (!currentKeysToClean.isEmpty() || !currentFullClean.isEmpty()) {
-            for (Iterator<Key> iterator = cache.keys().iterator(); iterator.hasNext(); ) {
+            for (Iterator<Key> iterator = cache.asMap().keySet().iterator(); iterator.hasNext(); ) {
                 Key key = iterator.next();
                 if (currentFullClean.contains(key.entity.getCacheIdentity())) {
                     iterator.remove();
@@ -321,7 +345,7 @@ public final class IndicesRequestCache extends AbstractComponent implements Remo
             }
         }
 
-        cache.refresh();
+        cache.cleanUp();
     }
 
 
@@ -329,7 +353,7 @@ public final class IndicesRequestCache extends AbstractComponent implements Remo
      * Returns the current size of the cache
      */
     final int count() {
-        return cache.count();
+        return cache.asMap().size();
     }
 
     final int numRegisteredCloseListeners() { // for testing

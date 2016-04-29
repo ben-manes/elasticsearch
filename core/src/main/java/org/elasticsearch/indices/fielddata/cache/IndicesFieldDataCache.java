@@ -19,16 +19,15 @@
 
 package org.elasticsearch.indices.fielddata.cache;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.util.Accountable;
 import org.elasticsearch.common.Nullable;
-import org.elasticsearch.common.cache.Cache;
-import org.elasticsearch.common.cache.CacheBuilder;
-import org.elasticsearch.common.cache.RemovalListener;
-import org.elasticsearch.common.cache.RemovalNotification;
 import org.elasticsearch.common.component.AbstractComponent;
 import org.elasticsearch.common.lease.Releasable;
 import org.elasticsearch.common.logging.ESLogger;
@@ -44,9 +43,11 @@ import org.elasticsearch.index.fielddata.IndexFieldDataCache;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.shard.ShardUtils;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.function.ToLongBiFunction;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalCause;
+import com.github.benmanes.caffeine.cache.RemovalListener;
+import com.github.benmanes.caffeine.cache.Weigher;
 
 /**
  */
@@ -61,10 +62,9 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
         super(settings);
         this.indicesFieldDataCacheListener = indicesFieldDataCacheListener;
         final long sizeInBytes = INDICES_FIELDDATA_CACHE_SIZE_KEY.get(settings).bytes();
-        CacheBuilder<Key, Accountable> cacheBuilder = CacheBuilder.<Key, Accountable>builder()
-                .removalListener(this);
+        Caffeine<Key, Accountable> cacheBuilder = Caffeine.newBuilder().removalListener(this);
         if (sizeInBytes > 0) {
-            cacheBuilder.setMaximumWeight(sizeInBytes).weigher(new FieldDataWeigher());
+            cacheBuilder.maximumWeight(sizeInBytes).weigher(new FieldDataWeigher());
         }
         cache = cacheBuilder.build();
     }
@@ -83,14 +83,12 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
     }
 
     @Override
-    public void onRemoval(RemovalNotification<Key, Accountable> notification) {
-        Key key = notification.getKey();
+    public void onRemoval(Key key, Accountable value, RemovalCause cause) {
         assert key != null && key.listeners != null;
         IndexFieldCache indexCache = key.indexCache;
-        final Accountable value = notification.getValue();
         for (IndexFieldDataCache.Listener listener : key.listeners) {
             try {
-                listener.onRemoval(key.shardId, indexCache.fieldName, notification.getRemovalReason() == RemovalNotification.RemovalReason.EVICTED, value.ramBytesUsed());
+                listener.onRemoval(key.shardId, indexCache.fieldName, cause.wasEvicted(), value.ramBytesUsed());
             } catch (Throwable e) {
                 // load anyway since listeners should not throw exceptions
                 logger.error("Failed to call listener on field data cache unloading", e);
@@ -98,9 +96,9 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
         }
     }
 
-    public static class FieldDataWeigher implements ToLongBiFunction<Key, Accountable> {
+    public static class FieldDataWeigher implements Weigher<Key, Accountable> {
         @Override
-        public long applyAsLong(Key key, Accountable ramUsage) {
+        public int weigh(Key key, Accountable ramUsage) {
             int weight = (int) Math.min(ramUsage.ramBytesUsed(), Integer.MAX_VALUE);
             return weight == 0 ? 1 : weight;
         }
@@ -129,21 +127,25 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
             final ShardId shardId = ShardUtils.extractShardId(context.reader());
             final Key key = new Key(this, context.reader().getCoreCacheKey(), shardId);
             //noinspection unchecked
-            final Accountable accountable = cache.computeIfAbsent(key, k -> {
+            final Accountable accountable = cache.get(key, k -> {
                 context.reader().addCoreClosedListener(IndexFieldCache.this);
                 for (Listener listener : this.listeners) {
                     k.listeners.add(listener);
                 }
-                final AtomicFieldData fieldData = indexFieldData.loadDirect(context);
-                for (Listener listener : k.listeners) {
-                    try {
-                        listener.onCache(shardId, fieldName, fieldData);
-                    } catch (Throwable e) {
-                        // load anyway since listeners should not throw exceptions
-                        logger.error("Failed to call listener on atomic field data loading", e);
+                try {
+                    final AtomicFieldData fieldData = indexFieldData.loadDirect(context);
+                    for (Listener listener : k.listeners) {
+                        try {
+                            listener.onCache(shardId, fieldName, fieldData);
+                        } catch (Throwable e) {
+                            // load anyway since listeners should not throw exceptions
+                            logger.error("Failed to call listener on atomic field data loading", e);
+                        }
                     }
+                    return fieldData;
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
                 }
-                return fieldData;
             });
             return (FD) accountable;
         }
@@ -153,21 +155,25 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
             final ShardId shardId = ShardUtils.extractShardId(indexReader);
             final Key key = new Key(this, indexReader.getCoreCacheKey(), shardId);
             //noinspection unchecked
-            final Accountable accountable = cache.computeIfAbsent(key, k -> {
+            final Accountable accountable = cache.get(key, k -> {
                 ElasticsearchDirectoryReader.addReaderCloseListener(indexReader, IndexFieldCache.this);
                 for (Listener listener : this.listeners) {
                     k.listeners.add(listener);
                 }
-                final Accountable ifd = (Accountable) indexFieldData.localGlobalDirect(indexReader);
-                for (Listener listener : k.listeners) {
-                    try {
-                        listener.onCache(shardId, fieldName, ifd);
-                    } catch (Throwable e) {
-                        // load anyway since listeners should not throw exceptions
-                        logger.error("Failed to call listener on global ordinals loading", e);
+                try {
+                    Accountable ifd = (Accountable) indexFieldData.localGlobalDirect(indexReader);
+                    for (Listener listener : k.listeners) {
+                      try {
+                          listener.onCache(shardId, fieldName, ifd);
+                      } catch (Throwable e) {
+                          // load anyway since listeners should not throw exceptions
+                          logger.error("Failed to call listener on global ordinals loading", e);
+                      }
                     }
+                    return ifd;
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
                 }
-                return ifd;
             });
             return (IFD) accountable;
         }
@@ -186,18 +192,18 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
 
         @Override
         public void clear() {
-            for (Key key : cache.keys()) {
+            for (Key key : cache.asMap().keySet()) {
                 if (key.indexCache.index.equals(index)) {
                     cache.invalidate(key);
                 }
             }
             // force eviction
-            cache.refresh();
+            cache.cleanUp();
         }
 
         @Override
         public void clear(String fieldName) {
-            for (Key key : cache.keys()) {
+            for (Key key : cache.asMap().keySet()) {
                 if (key.indexCache.index.equals(index)) {
                     if (key.indexCache.fieldName.equals(fieldName)) {
                         cache.invalidate(key);
@@ -207,7 +213,7 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
             // we call refresh because this is a manual operation, should happen
             // rarely and probably means the user wants to see memory returned as
             // soon as possible
-            cache.refresh();
+            cache.cleanUp();
         }
     }
 
@@ -226,10 +232,16 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
 
         @Override
         public boolean equals(Object o) {
-            if (this == o) return true;
+            if (this == o) {
+              return true;
+            }
             Key key = (Key) o;
-            if (!indexCache.equals(key.indexCache)) return false;
-            if (!readerKey.equals(key.readerKey)) return false;
+            if (!indexCache.equals(key.indexCache)) {
+              return false;
+            }
+            if (!readerKey.equals(key.readerKey)) {
+              return false;
+            }
             return true;
         }
 

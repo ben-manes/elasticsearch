@@ -19,6 +19,23 @@
 
 package org.elasticsearch.script;
 
+import static java.util.Collections.unmodifiableMap;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+
 import org.apache.lucene.util.IOUtils;
 import org.elasticsearch.ResourceNotFoundException;
 import org.elasticsearch.action.ActionListener;
@@ -35,10 +52,6 @@ import org.elasticsearch.common.ParseField;
 import org.elasticsearch.common.ParseFieldMatcher;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.bytes.BytesReference;
-import org.elasticsearch.common.cache.Cache;
-import org.elasticsearch.common.cache.CacheBuilder;
-import org.elasticsearch.common.cache.RemovalListener;
-import org.elasticsearch.common.cache.RemovalNotification;
 import org.elasticsearch.common.collect.Tuple;
 import org.elasticsearch.common.component.AbstractComponent;
 import org.elasticsearch.common.inject.Inject;
@@ -60,21 +73,10 @@ import org.elasticsearch.watcher.FileChangesListener;
 import org.elasticsearch.watcher.FileWatcher;
 import org.elasticsearch.watcher.ResourceWatcherService;
 
-import java.io.Closeable;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
-import java.util.concurrent.ConcurrentMap;
-
-import static java.util.Collections.unmodifiableMap;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalCause;
+import com.github.benmanes.caffeine.cache.RemovalListener;
 
 public class ScriptService extends AbstractComponent implements Closeable {
 
@@ -151,14 +153,14 @@ public class ScriptService extends AbstractComponent implements Closeable {
 
         this.defaultLang = scriptSettings.getDefaultScriptLanguageSetting().get(settings);
 
-        CacheBuilder<CacheKey, CompiledScript> cacheBuilder = CacheBuilder.builder();
+        Caffeine<Object, Object> cacheBuilder = Caffeine.newBuilder();
         if (cacheMaxSize >= 0) {
-            cacheBuilder.setMaximumWeight(cacheMaxSize);
+            cacheBuilder.maximumSize(cacheMaxSize);
         }
 
         TimeValue cacheExpire = SCRIPT_CACHE_EXPIRE_SETTING.get(settings);
         if (cacheExpire.getNanos() != 0) {
-            cacheBuilder.setExpireAfterAccess(cacheExpire.nanos());
+            cacheBuilder.expireAfterAccess(cacheExpire.nanos(), TimeUnit.NANOSECONDS);
         }
 
         logger.debug("using script cache with max_size [{}], expire [{}]", cacheMaxSize, cacheExpire);
@@ -298,7 +300,7 @@ public class ScriptService extends AbstractComponent implements Closeable {
         }
 
         CacheKey cacheKey = new CacheKey(scriptEngineService, type == ScriptType.INLINE ? null : name, code, params);
-        CompiledScript compiledScript = cache.get(cacheKey);
+        CompiledScript compiledScript = cache.getIfPresent(cacheKey);
 
         if (compiledScript == null) {
             //Either an un-cached inline script or indexed script
@@ -509,11 +511,11 @@ public class ScriptService extends AbstractComponent implements Closeable {
      */
     private class ScriptCacheRemovalListener implements RemovalListener<CacheKey, CompiledScript> {
         @Override
-        public void onRemoval(RemovalNotification<CacheKey, CompiledScript> notification) {
+        public void onRemoval(CacheKey key, CompiledScript value, RemovalCause cause) {
             scriptMetrics.onCacheEviction();
             for (ScriptEngineService service : scriptEngines) {
                 try {
-                    service.scriptRemoved(notification.getValue());
+                    service.scriptRemoved(value);
                 } catch (Exception e) {
                     logger.warn("exception calling script removal listener for script service", e);
                     // We don't rethrow because Guava would just catch the
@@ -676,14 +678,24 @@ public class ScriptService extends AbstractComponent implements Closeable {
 
         @Override
         public boolean equals(Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
+            if (this == o) {
+              return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+              return false;
+            }
 
             CacheKey cacheKey = (CacheKey)o;
 
-            if (!lang.equals(cacheKey.lang)) return false;
-            if (name != null ? !name.equals(cacheKey.name) : cacheKey.name != null) return false;
-            if (code != null ? !code.equals(cacheKey.code) : cacheKey.code != null) return false;
+            if (!lang.equals(cacheKey.lang)) {
+              return false;
+            }
+            if (name != null ? !name.equals(cacheKey.name) : cacheKey.name != null) {
+              return false;
+            }
+            if (code != null ? !code.equals(cacheKey.code) : cacheKey.code != null) {
+              return false;
+            }
             return params.equals(cacheKey.params);
 
         }

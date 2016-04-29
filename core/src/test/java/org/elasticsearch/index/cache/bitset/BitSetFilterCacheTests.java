@@ -19,6 +19,12 @@
 
 package org.elasticsearch.index.cache.bitset;
 
+import static org.hamcrest.Matchers.equalTo;
+
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
@@ -45,12 +51,6 @@ import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.IndexSettingsModule;
-
-import java.io.IOException;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-
-import static org.hamcrest.Matchers.equalTo;
 
 public class BitSetFilterCacheTests extends ESTestCase {
 
@@ -108,7 +108,7 @@ public class BitSetFilterCacheTests extends ESTestCase {
         // now cached
         assertThat(matchCount(filter, reader), equalTo(3));
         // There are 3 segments
-        assertThat(cache.getLoadedFilters().weight(), equalTo(3L));
+        assertThat(cache.getLoadedFilters().policy().eviction().get().getMaximum(), equalTo(3L));
 
         writer.forceMerge(1);
         reader.close();
@@ -121,12 +121,12 @@ public class BitSetFilterCacheTests extends ESTestCase {
         // now cached
         assertThat(matchCount(filter, reader), equalTo(3));
         // Only one segment now, so the size must be 1
-        assertThat(cache.getLoadedFilters().weight(), equalTo(1L));
+        assertThat(cache.getLoadedFilters().policy().eviction().get().getMaximum(), equalTo(1L));
 
         reader.close();
         writer.close();
         // There is no reference from readers and writer to any segment in the test index, so the size in the fbs cache must be 0
-        assertThat(cache.getLoadedFilters().weight(), equalTo(0L));
+        assertThat(cache.getLoadedFilters().policy().eviction().get().getMaximum(), equalTo(0L));
     }
 
     public void testListener() throws IOException {

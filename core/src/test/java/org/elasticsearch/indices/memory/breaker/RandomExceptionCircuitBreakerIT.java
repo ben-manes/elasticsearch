@@ -176,7 +176,7 @@ public class RandomExceptionCircuitBreakerIT extends ESIntegTestCase {
                 for (String node : internalCluster().getNodeNames()) {
                     final IndicesFieldDataCache fdCache = internalCluster().getInstance(IndicesService.class, node).getIndicesFieldDataCache();
                     // Clean up the cache, ensuring that entries' listeners have been called
-                    fdCache.getCache().refresh();
+                    fdCache.getCache().cleanUp();
                 }
                 NodesStatsResponse nodeStats = client().admin().cluster().prepareNodesStats()
                         .clear().setBreaker(true).execute().actionGet();

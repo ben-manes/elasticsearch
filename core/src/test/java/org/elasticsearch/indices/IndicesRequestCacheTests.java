@@ -19,6 +19,10 @@
 
 package org.elasticsearch.indices;
 
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.StringField;
@@ -32,7 +36,6 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.IOUtils;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
-import org.elasticsearch.common.cache.RemovalNotification;
 import org.elasticsearch.common.lucene.index.ElasticsearchDirectoryReader;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
@@ -41,9 +44,7 @@ import org.elasticsearch.index.query.TermQueryBuilder;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.test.ESTestCase;
 
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicBoolean;
+import com.github.benmanes.caffeine.cache.RemovalCause;
 
 public class IndicesRequestCacheTests extends ESTestCase {
 
@@ -393,9 +394,8 @@ public class IndicesRequestCacheTests extends ESTestCase {
         }
 
         @Override
-        public void onRemoval(RemovalNotification<IndicesRequestCache.Key, IndicesRequestCache.Value> notification) {
-            shardRequestCache.onRemoval(notification.getKey(), notification.getValue(),
-                notification.getRemovalReason() == RemovalNotification.RemovalReason.EVICTED);
+        public void onRemoval(IndicesRequestCache.Key key, IndicesRequestCache.Value value, RemovalCause cause) {
+            shardRequestCache.onRemoval(key, value, cause.wasEvicted());
         }
     }
 }
